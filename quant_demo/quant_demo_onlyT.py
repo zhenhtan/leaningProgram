@@ -97,6 +97,42 @@ def calc_max_drawdown(equity_curve: pd.Series) -> tuple[float, pd.Timestamp | No
     return float(drawdown_amount.loc[max_dd_date]), max_dd_date
 
 
+def calc_realized_unrealized_pnl(
+    trades: pd.DataFrame,
+    initial_shares: int,
+    initial_cost_per_share: float,
+    final_price: float,
+) -> tuple[float, float, float, float]:
+    """按平均成本法分解收益：已实现、未实现、合计与期末持仓平均成本。"""
+    holdings = int(initial_shares)
+    cost_basis_total = float(initial_shares) * float(initial_cost_per_share)
+    realized_pnl = 0.0
+
+    if not trades.empty:
+        ordered = trades.sort_values("date")
+        for row in ordered.itertuples(index=False):
+            qty = int(row.shares)
+            price = float(row.price)
+            action = str(row.action).upper()
+
+            if action == "BUY":
+                holdings += qty
+                cost_basis_total += qty * price
+            elif action == "SELL":
+                if holdings <= 0:
+                    continue
+                sell_qty = min(qty, holdings)
+                avg_cost = cost_basis_total / holdings if holdings > 0 else 0.0
+                realized_pnl += (price - avg_cost) * sell_qty
+                holdings -= sell_qty
+                cost_basis_total -= avg_cost * sell_qty
+
+    avg_cost_end = (cost_basis_total / holdings) if holdings > 0 else 0.0
+    unrealized_pnl = holdings * float(final_price) - cost_basis_total
+    total_pnl = realized_pnl + unrealized_pnl
+    return realized_pnl, unrealized_pnl, total_pnl, avg_cost_end
+
+
 def backtest_benchmark_with_pre_sell(
     df: pd.DataFrame,
     init_cash: float,
@@ -104,22 +140,14 @@ def backtest_benchmark_with_pre_sell(
     pre_sell_price: float,
     pre_sell_ratio: float = 0.5,
 ) -> tuple[int, float, pd.Series, bool]:
-    """基准策略：持有不做网格，仅在首次触达阈值时减仓一次。"""
+    """基准策略：持有不做网格，不执行首次触达减仓。"""
     cash = init_cash
     shares = init_shares
     pre_sell_done = False
     equity_points = []
 
     for date, row in df.iterrows():
-        high = float(row["high"])
         close = float(row["close"])
-
-        if (not pre_sell_done) and high >= pre_sell_price and shares > 0:
-            sell_shares = max(1, int(shares * pre_sell_ratio))
-            cash += sell_shares * pre_sell_price
-            shares -= sell_shares
-            pre_sell_done = True
-
         equity_points.append({"date": date, "equity": cash + shares * close})
 
     equity_curve = pd.DataFrame(equity_points).set_index("date")["equity"] if equity_points else pd.Series(dtype=float)
@@ -135,7 +163,18 @@ def get_mode_params(mode: str, init_shares: int) -> dict:
             "trade_ratio": 0.05,
         },
         "normal": {
-            "grid_start_threshold": 1.50,
+        # 回归测试从2023-07-01到2024-06-26，网格交易参数调整为更适合当前市场的设置
+        # 截止2026-06-26，剩余股数是180000/初始股数500000=0.36，交易比例为0.02(500000*0.02=10000)，网格间距为0.03元，T操作启动阈值为1.20元
+        # 前提是要预留10W元现金，初始现金为10W，初始持仓为50W股，网格交易启动阈值为1.20元，网格间距为0.03元，每次交易股数为10000股
+        # 注意前期要一次性买入50W股，后期必须进行清仓操作并中止网格交易．
+        
+        # [4] 策略对比总结：
+        # 网格交易收益率：+70.91%
+        # 网格交易最大回撤金额：193,499.98（发生日期：2024-09-23）
+        # Buy-and-Hold收益率：+86.19%
+        # Buy-and-Hold最大回撤金额：193,499.98（发生日期：2024-09-23）
+        # 超额收益：-15.28%
+            "grid_start_threshold": 1.20,
             "grid_step": 0.03,
             "trade_ratio": 0.02,
         },
@@ -178,7 +217,6 @@ def backtest_grid(
     cash = init_cash
     shares = init_shares
     current_base = base_price
-    pre_sell_done = False
     trades = []
     equity_points = []
     if pnl_base_total is None:
@@ -195,38 +233,6 @@ def backtest_grid(
         low = float(row["low"])
         close = float(row["close"])
         decimals = max(1, len(str(grid_step).split(".")[-1]))
-
-        # 一次性规则：首次触达 pre_sell_price 时先卖出半仓
-        if (not pre_sell_done) and high >= pre_sell_price and shares > 0:
-            half_shares = int(shares * pre_sell_ratio)
-            half_shares = max(1, half_shares)
-            trade_price = round(pre_sell_price, decimals)
-            shares -= half_shares
-            cash += half_shares * trade_price
-            current_base = trade_price
-            pre_sell_done = True
-            if debug:
-                print(
-                    f"    [DEBUG] {date.date()} 触发半仓卖出: 最高价{high:.4f} >= {trade_price:.4f}, "
-                    f"卖出{half_shares}股, BASE更新为{current_base:.4f}"
-                )
-            total_assets = cash + shares * close
-            profit = total_assets - pnl_base_total
-            profit_pct = (profit / pnl_base_total * 100) if pnl_base_total else 0.0
-            trades.append(
-                {
-                    "date": date,
-                    "action": "SELL",
-                    "price": trade_price,
-                    "shares": half_shares,
-                    "position": shares,
-                    "cash": cash,
-                    "base_price": current_base,
-                    "total_assets": total_assets,
-                    "profit": profit,
-                    "profit_pct": profit_pct,
-                }
-            )
 
         # 先处理卖出（高价）
         while high >= current_base + grid_step and shares >= trade_shares:
@@ -317,7 +323,7 @@ def main(mode: str = "normal"):
     SYMBOL = "588000"     # 科创50ETF华夏；A股: "000001" 平安银行 / 港股: "0700.HK" / 美股: "AAPL"
     START = "20230701"
     END = "20260626"
-    INIT_CASH = 0.0
+    INIT_CASH = 100_000.0
     INIT_SHARES = 500_000
     mode_params = get_mode_params(mode, INIT_SHARES)
     GRID_START_THRESHOLD = mode_params["grid_start_threshold"]
@@ -328,8 +334,7 @@ def main(mode: str = "normal"):
 
     print(f"[0] 参数档位: {mode}")
     print(
-        f"    启动阈值={GRID_START_THRESHOLD:.2f}, 网格间距={GRID_STEP:.2f}, 单次交易股数={TRADE_SHARES}, "
-        f"首次触达{PRE_SELL_PRICE:.2f}先卖出{int(PRE_SELL_RATIO * 100)}%持仓"
+        f"    启动阈值={GRID_START_THRESHOLD:.2f}, 网格间距={GRID_STEP:.2f}, 单次交易股数={TRADE_SHARES}"
     )
     print(f"[1] 获取 {SYMBOL} 日K数据 {START}~{END} ...")
     df = get_daily_data(SYMBOL, START, END)
@@ -391,7 +396,7 @@ def main(mode: str = "normal"):
     print(
         f"    参数: 初始持仓={INIT_SHARES}股, 启动条件=价格>{GRID_START_THRESHOLD:.2f}元, "
         f"启动日={grid_start_date.date()}, BASE={BASE_PRICE:.1f}（基于启动日开盘价{grid_start_open:.4f}自动计算）, "
-        f"每变动{GRID_STEP}元交易{TRADE_SHARES}股, 首次触达{PRE_SELL_PRICE:.2f}先卖出{int(PRE_SELL_RATIO * 100)}%持仓"
+        f"每变动{GRID_STEP}元交易{TRADE_SHARES}股"
     )
     initial_total = INIT_CASH + INIT_SHARES * first_open_price
     final_value, trades, final_shares, final_cash, final_base, grid_equity_curve = backtest_grid(
@@ -409,6 +414,13 @@ def main(mode: str = "normal"):
     final_price = float(df["close"].iloc[-1])
     final_stock_value = final_shares * final_price
     final_total_assets = final_cash + final_stock_value
+    total_profit_amount = final_total_assets - initial_total
+    realized_pnl, unrealized_pnl, decomposed_total_pnl, avg_cost_end = calc_realized_unrealized_pnl(
+        trades,
+        initial_shares=INIT_SHARES,
+        initial_cost_per_share=first_open_price,
+        final_price=final_price,
+    )
 
     pre_grid_curve = INIT_CASH + INIT_SHARES * df[df.index < grid_start_date]["close"]
     strategy_curve = pd.concat([pre_grid_curve, grid_equity_curve])
@@ -441,6 +453,13 @@ def main(mode: str = "normal"):
         f"    资产明细：{final_shares:,}股 * {final_price:.4f} = {final_stock_value:,.2f} "
         f"+ 现金{final_cash:,.2f} = {final_total_assets:,.2f}"
     )
+    print("    收益分解（平均成本法，配对成交口径）：")
+    print(f"      已实现收益：{realized_pnl:+,.2f}")
+    print(f"      未实现收益：{unrealized_pnl:+,.2f}")
+    print(f"      分解合计：{decomposed_total_pnl:+,.2f}")
+    print(f"      总收益额：{total_profit_amount:+,.2f}（= 期末总资产 - 期初总资产）")
+    print(f"      期末持仓平均成本：{avg_cost_end:.4f}")
+    print(f"      一致性校验（分解合计-总收益额）：{(decomposed_total_pnl - total_profit_amount):+.6f}")
     print(f"    总收益率：{pct:+.2f}%\n")
     
     # 显示买卖触发条件的诊断信息
@@ -463,7 +482,7 @@ def main(mode: str = "normal"):
     print(f"    最终BASE：{final_base:.4f}\n")
 
     # 计算 buy-and-hold（不做任何交易）的对比基准
-    print("[3] 基准对比（Buy-and-Hold + 首次触达减仓）:")
+    print("[3] 基准对比（Buy-and-Hold）:")
     bnh_final_stock_value = bnh_shares * final_price
     bnh_total_assets = bnh_cash + bnh_final_stock_value
     bnh_pct = (bnh_total_assets - initial_total) / initial_total * 100 if initial_total else 0.0
@@ -478,8 +497,7 @@ def main(mode: str = "normal"):
         f"    资产明细：{bnh_shares:,}股 * {final_price:.4f} = {bnh_final_stock_value:,.2f} "
         f"+ 现金{bnh_cash:,.2f} = {bnh_total_assets:,.2f}"
     )
-    pre_sell_msg = "已触发" if bnh_pre_sell_done else "未触发"
-    print(f"    首次触达减仓：{pre_sell_msg}（阈值={PRE_SELL_PRICE:.2f}，减仓比例={int(PRE_SELL_RATIO * 100)}%）")
+    print("    首次触达减仓：已关闭")
     print(f"    收益率：{bnh_pct:+.2f}%\n")
 
     # 输出对比
@@ -514,18 +532,40 @@ def main(mode: str = "normal"):
         sell_trades = trades[trades["action"] == "SELL"]
         total_buy_cost = (buy_trades["price"] * buy_trades["shares"]).sum()
         total_sell_revenue = (sell_trades["price"] * sell_trades["shares"]).sum()
-        total_profit = total_sell_revenue - total_buy_cost
+        trade_cash_net_inflow = total_sell_revenue - total_buy_cost
+        cash_change = final_cash - INIT_CASH
         t_trade_count = min(len(buy_trades), len(sell_trades))
         t_profit_per_trade = TRADE_SHARES * GRID_STEP - 10
         t_operation_profit = t_trade_count * t_profit_per_trade
+        trade_ratio = (TRADE_SHARES / INIT_SHARES) if INIT_SHARES else 0.0
+        buy_cnt = len(buy_trades)
+        sell_cnt = len(sell_trades)
+        net_sell_cnt = max(0, sell_cnt - buy_cnt)
+        current_progress_price = GRID_START_THRESHOLD + GRID_STEP * net_sell_cnt
+        sell_ratio_progress = trade_ratio * net_sell_cnt
+        cnt_to_full_sell = int(np.ceil(1.0 / trade_ratio)) if trade_ratio > 0 else 0
+        net_sell_shares_at_full = min(INIT_SHARES, cnt_to_full_sell * TRADE_SHARES)
+        full_position_target_price = (
+            GRID_START_THRESHOLD + GRID_STEP * cnt_to_full_sell if cnt_to_full_sell > 0 else GRID_START_THRESHOLD
+        )
         print(f"    买入笔数：{len(buy_trades)}")
         print(f"    卖出笔数：{len(sell_trades)}")
         print(f"    T操作笔数：{t_trade_count}")
         print(f"    每次T操作金额：{t_profit_per_trade:,.2f}")
         print(f"    T操作收益：{t_operation_profit:,.2f}")
+        print(
+            f"    当前进度价格：{current_progress_price:.4f}"
+            f"（GRID_START_THRESHOLD + grid_step*净卖出次数）"
+        )
+        print(f"    累计卖出比例：{sell_ratio_progress:.2%}（trade_ratio*净卖出次数）")
+        print(
+            f"    到达100%时刻净卖出数量：{net_sell_shares_at_full:,} 股，"
+            f"满仓目标价格：{full_position_target_price:.4f}"
+        )
         print(f"    总买入成本：{total_buy_cost:,.2f}")
         print(f"    总卖出收入：{total_sell_revenue:,.2f}")
-        print(f"    交易盈亏：{total_profit:+,.2f}")
+        print(f"    交易现金净流入：{trade_cash_net_inflow:+,.2f}（总卖出收入-总买入成本）")
+        print(f"    现金变动：{cash_change:+,.2f}（期末现金-期初现金）")
     else:
         print("[5] 没有产生交易（价格未触发网格阈值）")
 
