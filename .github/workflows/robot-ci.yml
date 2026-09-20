@@ -8,9 +8,9 @@
 #    因为 paths 不匹配而没有触发工作流，PR 上这个检查会永远停在 pending，
 #    Merge 按钮就被永久锁死。本仓库只有 2 个用例、跑一次几秒钟，全量跑更划算。
 #
-# 2. 【检查名硬编码】job 的 name 固定为 robot-tests。不要写成
-#    `test (${{ matrix.python-version }})` 这类带变量的名字 —— 以后一加 matrix，
-#    检查名会漂移成 `robot-tests (3.10)`，分支保护里勾的旧名字失效，合并被静默卡死。
+# 2. 【检查名硬编码】job 的 name 固定为 robot-tests。不要改成由 matrix 拼出来的名字
+#    （例如带上 Python 版本后缀变成 robot-tests (3.10)），否则分支保护里勾的旧名字会失效，
+#    合并被静默卡死，而且极难排查。
 #
 # 3. 【只跑 example.robot】robot_demo/selenium_example.robot 依赖 SeleniumLibrary
 #    和真实 Chrome，在 CI 里必然失败。所以这里写死文件路径，
@@ -154,8 +154,12 @@ jobs:
             });
             const title = (commits.data[0]?.commit?.message || `CI review: ${branch}`).split('\n')[0];
 
-            // 注意：这里刻意不用 ${{ }} 表达式 —— 在 JS 反引号模板串里混进 ${{ }} 是经典陷阱，
-            // 一旦替换没按预期发生就会变成语法错误。全部改从 context 取值，稳定且可本地校验。
+            // 这里刻意不写工作流表达式，全部改从 context 对象取值。
+            // 原因：script 的内容是一个字符串值，GitHub 会对它做表达式求值。
+            // 一旦在 JS 代码或它的字符串里出现了表达式的起止符号（花括号配美元符号那种写法），
+            // 而里面又不是合法表达式，整个工作流文件会被直接拒绝、job 根本不会启动
+            // —— 症状是 Actions 里出现一条 0 个 job 的失败记录，且没有任何报错提示。
+            // 用 context 取值既稳定，又能被 node --check 在本地校验。
             const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
 
             const body = [
