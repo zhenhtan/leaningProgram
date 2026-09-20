@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 虚拟环境
+.venv/
+venv/
+.ci_venv/
+
+# 本地临时验证目录
+.ci_tmp/
+
+# Office 打开文档时产生的锁文件
+~$*.docx
+~$*.xlsx
+~$*.pptx
+
+# 密钥：绝不能提交进仓库。
+# 注意仓库根目录当前有 yes（私钥）与 yes.pub（公钥），
+# 建议把这对密钥移到 ~/.ssh/ 下，不要留在仓库目录里。
+yes
+yes.pub
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+*.pem
+*.key

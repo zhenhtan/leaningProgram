@@ -1,0 +1,5 @@
+# 这些文件必须以 LF 存储并检出，不能因为 Windows 的 autocrlf 变成 CRLF：
+# 带 CRLF 的 shell 脚本会报 "bad interpreter: /usr/bin/env bash^M" 而完全无法执行。
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf

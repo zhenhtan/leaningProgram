@@ -1,0 +1,261 @@
+# Robot Framework CI/CD 流水线
+#
+# 触发 → 跑测试 → 出报告 → 自动开 PR → 在 PR 里发测试报告评论 → 门禁判定
+#
+# 几个刻意的设计决定，改动前请先读：
+#
+# 1. 【绝不加 paths 过滤】分支保护的语义是「必需检查必须存在且成功」。一旦某次 push
+#    因为 paths 不匹配而没有触发工作流，PR 上这个检查会永远停在 pending，
+#    Merge 按钮就被永久锁死。本仓库只有 2 个用例、跑一次几秒钟，全量跑更划算。
+#
+# 2. 【检查名硬编码】job 的 name 固定为 robot-tests。不要写成
+#    `test (${{ matrix.python-version }})` 这类带变量的名字 —— 以后一加 matrix，
+#    检查名会漂移成 `robot-tests (3.10)`，分支保护里勾的旧名字失效，合并被静默卡死。
+#
+# 3. 【只跑 example.robot】robot_demo/selenium_example.robot 依赖 SeleniumLibrary
+#    和真实 Chrome，在 CI 里必然失败。所以这里写死文件路径，
+#    绝不要改成 `robot robot_demo/` 或 `robot .`。
+#
+# 4. 【最后必须有门禁 step】robot 步骤带 continue-on-error 是为了「测试挂了也能出报告」，
+#    但它会让整个 job 仍然是 success。如果不补最后一个「Enforce」步骤，
+#    测试失败也会显示绿灯 —— 那是最糟糕的失败模式，门禁形同虚设。
+
+name: Robot CI
+
+on:
+  push:
+    # 推送到这个前缀的分支 → 跑测试 + 自动开一个指向 main 的 PR
+    branches: ['ci-demo/**']
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+# GITHUB_TOKEN 的默认权限往往不够：创建 PR 和发评论都需要显式声明。
+# 注意：即使这里声明了 pull-requests: write，仓库还必须打开
+# Settings → Actions → General → 「Allow GitHub Actions to create and approve pull requests」，
+# 否则建 PR 时会被拒绝。详见 robot_demo/GITHUB_ACTIONS_CI_SETUP.md
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+# 不用 cancel-in-progress：把正在跑的检查取消掉会产生 cancelled 状态，
+# 而 cancelled 不满足分支保护的「成功」要求，同样会卡住合并。
+concurrency:
+  group: robot-ci-${{ github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  robot-tests:
+    # 这个名字就是分支保护里要勾的检查名，改它等于让分支保护失效
+    name: robot-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      ARTIFACT_NAME: robot-results
+      REVIEW_FILE: robot_demo/review.md
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r robot_demo/requirements.txt
+
+      - name: Run example.robot
+        id: robot
+        continue-on-error: true
+        shell: bash
+        run: |
+          # bash 在 Actions 里默认带 -e，若不关掉，robot 一失败就会直接中断这一步，
+          # 我们就拿不到退出码，也就无法区分「用例失败」和「环境坏了」。
+          set +e
+          python -m robot --outputdir robot_demo robot_demo/example.robot
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          echo "robot 退出码：$code（0=全过，1~249=有 N 个用例失败，251/252/253/255=环境或参数问题）"
+          exit $code
+
+      - name: Build review report
+        if: always()
+        shell: bash
+        env:
+          ROBOT_EXIT_CODE: ${{ steps.robot.outputs.exit_code }}
+        run: |
+          args=(
+            --xml robot_demo/output.xml
+            --out "$REVIEW_FILE"
+            --json robot_demo/review.json
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            --artifact-name "$ARTIFACT_NAME"
+            --github-summary
+            --quiet
+          )
+          if [ -n "$ROBOT_EXIT_CODE" ]; then
+            args+=(--exit-code "$ROBOT_EXIT_CODE")
+          fi
+          python scripts/robot_summary.py "${args[@]}"
+          echo "---------- 报告预览 ----------"
+          cat "$REVIEW_FILE"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: robot-results
+          path: |
+            robot_demo/log.html
+            robot_demo/report.html
+            robot_demo/output.xml
+            robot_demo/review.md
+            robot_demo/review.json
+          if-no-files-found: warn
+
+      - name: Open review PR
+        id: pr
+        # 用 always() 而不是裸判断：即使依赖安装阶段就挂了，也要把单子开出来，
+        # 这样失败原因有个 PR 页面可以承载，而不是只留一条没人看的 Actions 红叉。
+        if: always() && github.event_name == 'push'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const base = 'main';
+            const branch = context.ref.replace('refs/heads/', '');
+
+            if (branch === base) {
+              core.info('当前分支就是 main，不创建 PR');
+              return;
+            }
+
+            // 先查有没有已开着的 PR，避免每次补提交都重复建单
+            const findOpen = async () => (await github.rest.pulls.list({
+              owner, repo, head: `${owner}:${branch}`, state: 'open', per_page: 100,
+            })).data;
+
+            const existing = await findOpen();
+            if (existing.length > 0) {
+              core.info(`分支 ${branch} 已有开着的 PR #${existing[0].number}，直接复用`);
+              core.setOutput('number', String(existing[0].number));
+              return;
+            }
+
+            const commits = await github.rest.repos.listCommits({
+              owner, repo, sha: branch, per_page: 1,
+            });
+            const title = (commits.data[0]?.commit?.message || `CI review: ${branch}`).split('\n')[0];
+
+            // 注意：这里刻意不用 ${{ }} 表达式 —— 在 JS 反引号模板串里混进 ${{ }} 是经典陷阱，
+            // 一旦替换没按预期发生就会变成语法错误。全部改从 context 取值，稳定且可本地校验。
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+
+            const body = [
+              '由 CI 自动创建的 review 单子。',
+              '',
+              `- 源分支：\`${branch}\``,
+              `- 目标分支：\`${base}\``,
+              `- 工作流运行：[#${context.runNumber}](${runUrl})`,
+              '',
+              '`robot-tests` 检查通过并满足分支保护要求后，即可点击 Merge 合并。',
+            ].join('\n');
+
+            try {
+              const created = await github.rest.pulls.create({
+                owner, repo, head: branch, base, title, body,
+              });
+              core.info(`已创建 PR #${created.data.number}：${title}`);
+              core.setOutput('number', String(created.data.number));
+            } catch (error) {
+              if (error.status !== 422) throw error;
+              // 422 通常是「已经存在同名 PR」，也可能是 token 权限不足。两种情况都再查一次。
+              const retry = await findOpen();
+              if (retry.length > 0) {
+                core.warning(`创建 PR 返回 422（很可能已存在），复用现有 PR #${retry[0].number}`);
+                core.setOutput('number', String(retry[0].number));
+                return;
+              }
+              core.setFailed([
+                `创建 PR 失败：${error.message}`,
+                '如果报错提到 "GitHub Actions is not permitted to create or approve pull requests"，',
+                '请到仓库 Settings → Actions → General 勾选',
+                '"Allow GitHub Actions to create and approve pull requests"。',
+              ].join('\n'));
+            }
+
+      - name: Comment review on PR
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER_FROM_PUSH: ${{ steps.pr.outputs.number }}
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- robot-ci-report -->';
+            const { owner, repo } = context.repo;
+
+            // 报告文件由上一步生成；若上一步都没跑到（比如 checkout 失败）就跳过评论
+            let body;
+            try {
+              body = fs.readFileSync('robot_demo/review.md', 'utf8');
+            } catch (error) {
+              core.warning(`读不到 robot_demo/review.md，跳过评论：${error.message}`);
+              return;
+            }
+
+            const pr = context.payload.pull_request;
+            // fork 提的 PR 拿到的是只读 token，发评论会 403。这种情况只跑测试不评论。
+            if (pr && pr.head.repo.full_name !== `${owner}/${repo}`) {
+              core.info(`PR #${pr.number} 来自 fork，token 只读，跳过评论`);
+              return;
+            }
+
+            let number = pr?.number;
+            if (!number && process.env.PR_NUMBER_FROM_PUSH) {
+              number = Number(process.env.PR_NUMBER_FROM_PUSH);
+            }
+            if (!number) {
+              core.warning('本次运行没有关联的 PR，跳过评论');
+              return;
+            }
+
+            // 去重：找到自己上次发的评论就原地更新，避免每次重跑都在时间线上堆一条。
+            // 必须用 paginate —— listComments 默认只返回 30 条，评论一多就会漏掉旧的那条。
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: number, per_page: 100,
+            });
+            const previous = comments.find((c) => c.body?.includes(marker));
+
+            if (previous) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: previous.id, body });
+              core.info(`已更新 PR #${number} 上的既有评论 ${previous.id}`);
+            } else {
+              const created = await github.rest.issues.createComment({ owner, repo, issue_number: number, body });
+              core.info(`已在 PR #${number} 上创建评论 ${created.data.id}`);
+            }
+
+      - name: Enforce test result
+        # 必须放在最后：无论前面成功失败都要跑，用它把 job 的真实结论定下来。
+        # 没有这一步，上面 continue-on-error 会让测试失败也显示成绿灯。
+        if: always()
+        shell: bash
+        env:
+          ROBOT_EXIT_CODE: ${{ steps.robot.outputs.exit_code }}
+        run: |
+          if [ -z "$ROBOT_EXIT_CODE" ]; then
+            echo "::error::没有拿到 robot 退出码，说明测试根本没执行起来（依赖安装或执行阶段就失败了）"
+            exit 1
+          fi
+          if [ "$ROBOT_EXIT_CODE" != "0" ]; then
+            echo "::error::example.robot 未通过（robot 退出码 $ROBOT_EXIT_CODE），本次检查判定为失败，禁止合并"
+            exit 1
+          fi
+          echo "example.robot 全部通过，检查通过"

@@ -1,0 +1,3 @@
+# 纯 ASCII，避免 pip 在 GBK 环境下读文件报 UnicodeDecodeError
+# 版本锁死，避免 CI 与本地跑出不同结果
+robotframework==7.4.2
