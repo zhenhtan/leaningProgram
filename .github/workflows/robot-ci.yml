@@ -59,12 +59,15 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
-          python-version: '3.10'
+          # 用 3.12 而不是 3.10：3.10 已于 2026-10 到期（EOL），
+          # runner 镜像迟早会移除它，届时流水线会因为找不到解释器而挂掉。
+          # 3.12 支持到 2028-10，且与本仓库本地环境（3.13）行为一致。
+          python-version: '3.12'
 
       - name: Install dependencies
         run: |
@@ -109,7 +112,7 @@ jobs:
 
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: robot-results
           path: |
@@ -125,7 +128,7 @@ jobs:
         # 用 always() 而不是裸判断：即使依赖安装阶段就挂了，也要把单子开出来，
         # 这样失败原因有个 PR 页面可以承载，而不是只留一条没人看的 Actions 红叉。
         if: always() && github.event_name == 'push'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const { owner, repo } = context.repo;
@@ -197,7 +200,7 @@ jobs:
 
       - name: Comment review on PR
         if: always()
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           PR_NUMBER_FROM_PUSH: ${{ steps.pr.outputs.number }}
         with:
