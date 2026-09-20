@@ -1,0 +1,17 @@
+# MCP + Qwen weather/stock demo dependencies
+# Install:
+#   pip install -r requirements.txt
+#
+# Tested on:
+#   mcp      2.2.0    - code is compatible with mcp 1.x (FastMCP) and 2.x (MCPServer)
+#   openai   3.15.0   - uses DashScope OpenAI compatible mode
+#   gradio   6.27.0   - compatible with Gradio 4 tuple history and 5/6 dict history
+#
+# Note: mcp SDK 2.x requires Python >= 3.10; mcp 1.x works on Python 3.9.
+#       The code uses PEP 604 union syntax (str | None) which requires Python 3.10+.
+#       Either upgrade to Python 3.10+, OR the test scripts handle this gracefully.
+
+mcp>=1.2.0
+openai>=1.40.0
+gradio>=4.44.0
+requests>=2.31.0
