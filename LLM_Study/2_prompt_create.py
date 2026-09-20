@@ -3,8 +3,16 @@ import dashscope
 import os
 
 # 从环境变量中获取 API Key
-
-dashscope.api_key = "sk-fecdd35ed6fd405f83d0f3e20115a21a"
+# 设置方式（PowerShell）：
+#   临时（当前会话）：  $env:DASHSCOPE_API_KEY = "你的API Key"
+#   永久（用户级）：   [Environment]::SetEnvironmentVariable("DASHSCOPE_API_KEY", "你的API Key", "User")
+api_key = os.getenv("DASHSCOPE_API_KEY")
+if not api_key:
+    raise EnvironmentError(
+        "未检测到环境变量 DASHSCOPE_API_KEY，请先设置后再运行："
+        "PowerShell 临时设置 `$env:DASHSCOPE_API_KEY = \"你的API Key\""
+    )
+dashscope.api_key = api_key
 
 # 基于 prompt 生成文本
 # 使用 deepseek-v3 模型
@@ -16,6 +24,13 @@ def get_completion(prompt, model="deepseek-v3"):
         result_format='message',  # 将输出设置为message形式
         temperature=0,  # 模型输出的随机性，0 表示随机性最小
     )
+    # 调用失败时直接抛出可读错误，避免后续 NoneType 报错难以定位
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"API 调用失败: status={response.status_code} "
+            f"code={response.code} message={response.message} "
+            f"request_id={response.request_id}"
+        )
     return response.output.choices[0].message.content  # 返回模型生成的文本
     
 user_prompt = """
